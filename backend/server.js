@@ -298,16 +298,118 @@ app.get("/orders", authenticateToken, (req, res) => {
     let params;
     
     if(req.user.role === "admin"){
-        sql = "SELECT o.id, o.status, o.total_amount, o.created_at, u.first_name, u.last_name, u.email FROM orders o INNER JOIN users u ON o.user_id = u.id ORDER BY o.created_at DESC";
+        sql = "SELECT o.id, o.status, o.total_amount, o.created_at, u.first_name, u.last_name, u.email, (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id = o.id) AS item_count FROM orders o INNER JOIN users u ON o.user_id = u.id ORDER BY o.created_at DESC";
         params = [];
     } else {
-        sql = "SELECT id, status, total_amount, created_at FROM orders WHERE user_id = ? ORDER BY created_at DESC";
+        sql = "SELECT o.id, o.status, o.total_amount, o.created_at, (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id = o.id) AS item_count FROM orders o WHERE o.user_id = ? ORDER BY o.created_at DESC";
         params = [req.user.id];
     }
     db.query(sql, params, (err, results) => {
         if (err) return res.status(500).json({message:"Server Error"});
         res.json(results);
     });
+});
+
+//GET /orders/my - current user orders
+app.get("/orders/my", authenticateToken, (req, res) =>{
+    const sql = "SELECT o.id, o.status, o.total_amount, o.created_at, (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id = o.id) AS item_count FROM orders o WHERE o.user_id = ? ORDER BY o.created_at DESC";
+    db.query(sql, [req.user.id], (err, results) => {
+        if(err) return res.status(500).json ({message: "Server Error"});
+        res.json(results);
+    });
+});
+
+//GET /orders/:id - single order
+app.get("/orders/:id", authenticateToken, (req, res) =>{
+    const orderId = Number(req.params.id);
+    if (!Number.isInteger(orderId) || orderId <= 0) {
+        return res.status(400).json({message: "Invalid order ID"});
+    }
+
+    let sql = "SELECT o.id, o.status, o.total_amount, o.created_at, u.first_name, u.last_name, u.email, oi.id AS item_id, oi.quantity, oi.price_at_purchase, oi.subtotal, p.name AS product_name FROM orders o INNER JOIN users u ON u.id = o.user_id LEFT JOIN order_items oi ON oi.order_id = o.id LEFT JOIN products p ON p.id = oi.product_id WHERE o.id = ?";
+    const params = [orderId];
+
+    // Customers can only view their own orders; admins can view any order.
+    if (req.user.role !== "admin") {
+        sql += " AND o.user_id = ?";
+        params.push(req.user.id);
+    }
+    sql += " ORDER BY oi.id ASC";
+
+    db.query(sql, params, (err, results) => {
+        if(err) return res.status(500).json ({message:"Server Error"});
+        if(results.length === 0){
+            return res.status(404).json ({
+                message: "Order Not Found"
+            });
+        }
+
+        const firstRow = results[0];
+        res.json({
+            id: firstRow.id,
+            status: firstRow.status,
+            total_amount: firstRow.total_amount,
+            created_at: firstRow.created_at,
+            customer: {
+                first_name: firstRow.first_name,
+                last_name: firstRow.last_name,
+                email: firstRow.email
+            },
+            items: results
+                .filter((row) => row.item_id !== null)
+                .map((row) => ({
+                    item_id: row.item_id,
+                    product_name: row.product_name,
+                    quantity: row.quantity,
+                    price_at_purchase: row.price_at_purchase,
+                    subtotal: row.subtotal
+                }))
+        });
+    });
+});
+
+// POST /reviews
+app.post("/reviews", authenticateToken, async (req, res) => {
+    const {product_id, rating, review_text} = req.body;
+
+    if (product_id === undefined || rating === undefined || !review_text?.trim()) {
+        return res.status(400).json({message: "Product ID, Rating, and Review Text are Required"});
+    }
+
+    const productId = Number(product_id);
+    const numericRating = Number(rating);
+    if (!Number.isInteger(productId) || productId <= 0) {
+        return res.status(400).json({message: "Product ID must be a positive integer"});
+    }
+    if (!Number.isInteger(numericRating) || numericRating < 1 || numericRating > 5) {
+        return res.status(400).json({message: "Rating must be between 1 and 5"});
+    }
+
+    try {
+        const products = await new Promise((resolve, reject) => {
+            db.query("SELECT id FROM products WHERE id = ?", [productId], (err, results) => {
+                if (err) reject(err); else resolve(results);
+            });
+        });
+        if (products.length === 0) {
+            return res.status(404).json({message: "Product Not Found"});
+        }
+
+        const mongo = getMongo();
+        const result = await mongo.collection("product_reviews").insertOne({
+            product_id: productId,
+            user_id: req.user.id,
+            first_name: req.user.email.split("@")[0],
+            rating: numericRating,
+            review_text: review_text.trim(),
+            created_at: new Date()
+        });
+
+        res.status(201).json({message: "Review Submitted", reviewId: result.insertedId});
+    } catch (err) {
+        console.error("Review submission failed:", err.message);
+        res.status(500).json({message: "Unable to submit review"});
+    }
 });
 
 async function startServer() {
